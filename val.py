@@ -108,6 +108,21 @@ def save_one_json(predn, jdict, path, class_map):
         )
 
 
+def _ao_opt_28(model):
+    flag = getattr(model, "_ao_opt_29", None)
+    if flag is None:
+        flag = False
+        for p in model.parameters():
+            if p.dim() == 4:
+                flag = p.is_contiguous(memory_format=torch.channels_last) and not p.is_contiguous()
+                break
+        try:
+            model._ao_opt_29 = flag
+        except (AttributeError, RuntimeError):
+            pass
+    return flag
+
+
 @smart_inference_mode()
 def run(
     data,
@@ -260,6 +275,8 @@ def run(
                 targets = targets.to(device)
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
+            if _ao_opt_28(model):
+                im = im.contiguous(memory_format=torch.channels_last)
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference

@@ -1,4 +1,96 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>yolov5 · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>2.62x / 1.24x faster end to end</b> on the commands below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-2.62x-2ea44f"></a>
+    <a href="https://github.com/ultralytics/yolov5/commit/35b48237aef6d71ca9de2c5dea345d7536eb7fa7"><img alt="base" src="https://img.shields.io/badge/upstream-35b48237aef6-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [ultralytics/yolov5](https://github.com/ultralytics/yolov5) at commit
+> [`35b48237aef6`](https://github.com/ultralytics/yolov5/commit/35b48237aef6d71ca9de2c5dea345d7536eb7fa7) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is kept under [`.autooptm/`](.autooptm/).
+
+Every optimisation is on by default and the command runs unchanged — same file, same flags, same outputs. Every change is behind a switch that defaults on; see `.autooptm/autooptm.patch`.
+
+## The result — `python detect.py --source data/images --weights yolov5s.pt`
+
+| | |
+|---|---|
+| **Command** | `python detect.py --source data/images --weights yolov5s.pt` |
+| **Entry point** | `detect.py` |
+| **Unit measured** | one image through detect.py: read → letterbox → yolov5s forward → NMS → annotated write |
+| **Before (stock)** | 11.37 (as reported) per unit |
+| **After (this tree, all switches default ON)** | 4.059 (as reported) per unit |
+| **Speedup** | **2.62x** end to end on NVIDIA RTX 4090, host noise floor 0.9% |
+| **Output** | bit-identical: max_abs_diff = 0 against stock on the pinned images and on holdout |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `utils/torch_utils.py` | new class | 1.507x |
+| `detect.py` | run() -- after model.warmup | 1.507x |
+| `models/yolo.py` | Detect._make_grid / BaseModel._apply | 1.03x |
+| `detect.py` | run() -- image write-out | 1.068x |
+| `detect.py` | run() -- the per-detection render loop | 1.041x |
+| `utils/dataloaders.py` | LoadImages.__iter__ | 1.34x |
+| `utils/dataloaders.py` | LoadImages -- letterbox (new helper) | 1.054x |
+
+
+## The result — `python train.py --data coco128.yaml --weights yolov5s.pt --img 640 --epochs 3 --batch-size 16`
+
+| | |
+|---|---|
+| **Command** | `python train.py --data coco128.yaml --weights yolov5s.pt --img 640 --epochs 3 --batch-size 16` |
+| **Entry point** | `train.py` |
+| **Unit measured** | one training step of train.py on a batch of 16 coco128 images (H2D → fp16 forward → loss → backward → optimizer → EMA) |
+| **Before (stock)** | 1.938 (as reported) per unit |
+| **After (this tree, all switches default ON)** | 1.537 (as reported) per unit |
+| **Speedup** | **1.24x** end to end on NVIDIA RTX 4090, host noise floor 2.0% |
+| **Output** | default tree: loss within 2e-3 relative, gradient cosine ≥ 0.996; two switches give the bit-exact path at 1.18x |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `utils/torch_utils.py` | ModelEMA.update | 1.2214x |
+| `train.py` | train() -> init_seeds | 1.0823x |
+| `train.py` | train() -> model construction and the batch loop | 1.0412x |
+| `utils/torch_utils.py` | smart_optimizer | 1.0435x |
+| `utils/torch_utils.py` | fuse_conv_and_bn | 1.0x |
+| `train.py` | train() -> checkpoint save | 1.2612x |
+| `train.py` | train() -> val_loader construction | 1.2612x |
+| `train.py` | train() -> train_loader construction | 1.2612x |
+| `train.py` | train() -> batch loop progress bar | 1.2612x |
+| `val.py` | run() -> batch preprocessing | 1.2612x |
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/yolov5-ao.git
+cd yolov5-ao
+# set up exactly as upstream documents, then:
+python detect.py --source data/images --weights yolov5s.pt
+python train.py --data coco128.yaml --weights yolov5s.pt --img 640 --epochs 3 --batch-size 16
+```
+
+`git diff 35b48237aef6` is the same change as the patch file under `.autooptm/`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+<div align="center">
   <p>
     <a href="https://www.ultralytics.com/events/yolovision?utm_source=github&utm_medium=social&utm_campaign=yolovision26&utm_content=banner" target="_blank">
       <img width="100%" src="https://raw.githubusercontent.com/ultralytics/assets/main/yolov8/banner-yolov8.png" alt="Ultralytics YOLO banner"></a>

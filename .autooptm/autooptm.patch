@@ -1,0 +1,448 @@
+diff --git a/detect.py b/detect.py
+index 4e19f85..47eed55 100644
+--- a/detect.py
++++ b/detect.py
+@@ -64,7 +64,32 @@ from utils.general import (
+     strip_optimizer,
+     xyxy2xywh,
+ )
+-from utils.torch_utils import select_device, smart_inference_mode
++from utils.torch_utils import Opt21, select_device, smart_inference_mode
++
++
++class _Opt12:
++
++    def __init__(self, depth=2):
++        import queue
++        import threading
++
++        self.q = queue.Queue(maxsize=depth)
++        self.thread = threading.Thread(target=self._run, daemon=True)
++        self.thread.start()
++
++    def _run(self):
++        while True:
++            item = self.q.get()
++            if item is None:
++                return
++            cv2.imwrite(item[0], item[1])
++
++    def write(self, path, im):
++        self.q.put((path, im))
++
++    def close(self):
++        self.q.put(None)
++        self.thread.join()
+ 
+ 
+ @smart_inference_mode()
+@@ -200,6 +225,13 @@ def run(
+ 
+     # Run inference
+     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
++    if pt and device.type != "cpu" and os.environ.get("YOLOV5_OPT_1", "1") != "0":
++        model.forward = Opt21(model.model)
++    writer = (
++        _Opt12()
++        if save_img and not webcam and os.environ.get("YOLOV5_OPT_2", "1") != "0"
++        else None
++    )
+     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+     for path, im, im0s, vid_cap, s in dataset:
+         with dt[0]:
+@@ -246,6 +278,7 @@ def run(
+             if len(det):
+                 # Rescale boxes from img_size to im0 size
+                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
++                det = det.cpu()
+ 
+                 # Print results
+                 for c in det[:, 5].unique():
+@@ -293,7 +326,10 @@ def run(
+             # Save results (image with detections)
+             if save_img:
+                 if dataset.mode == "image":
+-                    cv2.imwrite(save_path, im0)
++                    if writer is not None:
++                        writer.write(save_path, im0)
++                    else:
++                        cv2.imwrite(save_path, im0)
+                 else:  # 'video' or 'stream'
+                     if vid_path[i] != save_path:  # new video
+                         vid_path[i] = save_path
+@@ -312,6 +348,9 @@ def run(
+         # Print time (inference-only)
+         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
+ 
++    if writer is not None:
++        writer.close()
++
+     # Print results
+     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
+     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
+diff --git a/models/yolo.py b/models/yolo.py
+index 972690b..ee67d63 100644
+--- a/models/yolo.py
++++ b/models/yolo.py
+@@ -116,6 +116,10 @@ class Detect(nn.Module):
+ 
+     def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, "1.10.0")):  # noqa: B008
+         """Generates a mesh grid for anchor boxes with optional compatibility for torch versions < 1.10."""
++        key = (nx, ny, i)
++        cache = self.__dict__.setdefault("_grid_cache", {})
++        if key in cache:
++            return cache[key]
+         d = self.anchors[i].device
+         t = self.anchors[i].dtype
+         shape = 1, self.na, ny, nx, 2  # grid shape
+@@ -125,6 +129,7 @@ class Detect(nn.Module):
+         )  # torch>=1.10 compatibility
+         grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+         anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
++        cache[key] = (grid, anchor_grid)
+         return grid, anchor_grid
+ 
+ 
+@@ -206,6 +211,7 @@ class BaseModel(nn.Module):
+         m = self.model[-1]  # Detect()
+         if isinstance(m, (Detect, Segment)):
+             m.stride = fn(m.stride)
++            m.__dict__.pop("_grid_cache", None)
+             m.grid = list(map(fn, m.grid))
+             if isinstance(m.anchor_grid, list):
+                 m.anchor_grid = list(map(fn, m.anchor_grid))
+diff --git a/train.py b/train.py
+index 29b3498..a654947 100644
+--- a/train.py
++++ b/train.py
+@@ -18,6 +18,7 @@ import argparse
+ import math
+ import os
+ import random
++import shutil
+ import subprocess
+ import sys
+ import time
+@@ -97,6 +98,18 @@ from utils.torch_utils import (
+     torch_distributed_zero_first,
+ )
+ 
++def _ao_on(name, default="1"):
++    """True unless the env var is explicitly turned off."""
++    return str(os.getenv(name, default)).lower() not in ("0", "false", "no")
++
++
++AO_OPT_13 = _ao_on("YOLOV5_AO_OPT_3")
++AO_OPT_14 = _ao_on("YOLOV5_AO_OPT_4")
++AO_OPT_15 = _ao_on("YOLOV5_AO_OPT_5")
++AO_OPT_16 = _ao_on("YOLOV5_AO_OPT_6")
++AO_OPT_17 = _ao_on("YOLOV5_AO_OPT_7")
++AO_OPT_18 = _ao_on("YOLOV5_AO_OPT_8")
++
+ LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1"))  # https://pytorch.org/docs/stable/elastic/run.html
+ RANK = int(os.getenv("RANK", "-1"))
+ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
+@@ -188,7 +201,7 @@ def train(hyp, opt, device, callbacks):
+     # Config
+     plots = not evolve and not opt.noplots  # create plots
+     cuda = device.type != "cpu"
+-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
++    init_seeds(opt.seed + 1 + RANK, deterministic=not AO_OPT_13)
+     with torch_distributed_zero_first(LOCAL_RANK):
+         data_dict = data_dict or check_dataset(data)  # check if None
+     train_path, val_path = data_dict["train"], data_dict["val"]
+@@ -211,6 +224,11 @@ def train(hyp, opt, device, callbacks):
+         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
+     else:
+         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
++    if AO_OPT_17:
++        for _m in model.modules():
++            if isinstance(_m, nn.Conv2d) and _m.weight.dim() == 4:
++                _m.weight.data = _m.weight.data.contiguous(memory_format=torch.channels_last)
++
+     amp = check_amp(model)  # check AMP
+ 
+     # Freeze
+@@ -280,7 +298,7 @@ def train(hyp, opt, device, callbacks):
+         single_cls,
+         hyp=hyp,
+         augment=True,
+-        cache=None if opt.cache == "val" else opt.cache,
++        cache=None if opt.cache == "val" else (opt.cache or ("ram" if AO_OPT_18 else None)),
+         rect=opt.rect,
+         rank=LOCAL_RANK,
+         workers=workers,
+@@ -303,7 +321,7 @@ def train(hyp, opt, device, callbacks):
+             gs,
+             single_cls,
+             hyp=hyp,
+-            cache=None if noval else opt.cache,
++            cache=None if noval else (opt.cache or ("ram" if AO_OPT_16 else None)),
+             rect=True,
+             rank=-1,
+             workers=workers * 2,
+@@ -378,6 +396,8 @@ def train(hyp, opt, device, callbacks):
+             callbacks.run("on_train_batch_start")
+             ni = i + nb * epoch  # number integrated batches (since train start)
+             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
++            if AO_OPT_17:
++                imgs = imgs.contiguous(memory_format=torch.channels_last)
+ 
+             # Warmup
+             if ni <= nw:
+@@ -425,9 +445,10 @@ def train(hyp, opt, device, callbacks):
+             if RANK in {-1, 0}:
+                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
++                _ml = mloss.tolist() if AO_OPT_15 else mloss
+                 pbar.set_description(
+                     ("%11s" * 2 + "%11.4g" * 5)
+-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
++                    % (f"{epoch}/{epochs - 1}", mem, *_ml, targets.shape[0], imgs.shape[-1])
+                 )
+                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
+                 if callbacks.stop_training:
+@@ -482,7 +503,10 @@ def train(hyp, opt, device, callbacks):
+                 # Save last, best and delete
+                 torch.save(ckpt, last)
+                 if best_fitness == fi:
+-                    torch.save(ckpt, best)
++                    if AO_OPT_14:
++                        shutil.copyfile(last, best)
++                    else:
++                        torch.save(ckpt, best)
+                 if opt.save_period > 0 and epoch % opt.save_period == 0:
+                     torch.save(ckpt, w / f"epoch{epoch}.pt")
+                 del ckpt
+diff --git a/utils/dataloaders.py b/utils/dataloaders.py
+index 01369cc..799e051 100644
+--- a/utils/dataloaders.py
++++ b/utils/dataloaders.py
+@@ -262,6 +262,29 @@ class LoadScreenshots:
+         return str(self.screen), im, im0, None, s  # screen, img, original img, im0s, s
+ 
+ 
++_OPT_19 = {}
++
++
++def _opt_30(im0, img_size, stride):
++    new_shape = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
++    h, w = im0.shape[:2]
++    r = min(new_shape[0] / h, new_shape[1] / w)
++    nw, nh = round(w * r), round(h * r)
++    dw, dh = ((new_shape[1] - nw) % stride) / 2, ((new_shape[0] - nh) % stride) / 2
++    top, bottom = round(dh - 0.1), round(dh + 0.1)
++    left, right = round(dw - 0.1), round(dw + 0.1)
++    im = cv2.resize(im0, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nh, nw) != (h, w) else im0
++    if not (top or bottom or left or right):
++        return im
++    key = (nh + top + bottom, nw + left + right, top, left)
++    buf = _OPT_19.get(key)
++    if buf is None:
++        buf = np.full((key[0], key[1], 3), 114, dtype=np.uint8)
++        _OPT_19[key] = buf
++    buf[top : top + nh, left : left + nw] = im
++    return buf
++
++
+ class LoadImages:
+     """YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`."""
+ 
+@@ -294,6 +317,7 @@ class LoadImages:
+         self.auto = auto
+         self.transforms = transforms  # optional
+         self.vid_stride = vid_stride  # video frame-rate stride
++        self._queue = None
+         if any(videos):
+             self._new_video(videos[0])  # new video
+         else:
+@@ -305,10 +329,42 @@ class LoadImages:
+     def __iter__(self):
+         """Initializes iterator by resetting count and returns the iterator object itself."""
+         self.count = 0
++        self._queue = None
++        if os.environ.get("YOLOV5_OPT_9", "1") != "0" and not any(self.video_flag):
++            import queue
++            import threading
++
++            self._queue = queue.Queue(maxsize=2)
++            threading.Thread(target=self._opt_20, daemon=True).start()
+         return self
+ 
++    def _opt_20(self):
++        for i, path in enumerate(self.files):
++            try:
++                im0 = cv2.imread(path)  # BGR
++                assert im0 is not None, f"Image Not Found {path}"
++                if self.transforms:
++                    im = self.transforms(im0)
++                else:
++                    im = _opt_30(im0, self.img_size, self.stride)
++                    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
++                    im = np.ascontiguousarray(im)  # contiguous — releases the shared buffer
++                item = (path, im, im0, None, f"image {i + 1}/{self.nf} {path}: ")
++            except Exception as exc:  # raised in the consumer, where the stock code raises
++                item = exc
++            self._queue.put(item)
++        self._queue.put(None)
++
+     def __next__(self):
+         """Advances to the next file in the dataset, raising StopIteration if at the end."""
++        if self._queue is not None:
++            item = self._queue.get()
++            if item is None:
++                raise StopIteration
++            if isinstance(item, Exception):
++                raise item
++            self.count += 1
++            return item
+         if self.count == self.nf:
+             raise StopIteration
+         path = self.files[self.count]
+diff --git a/utils/torch_utils.py b/utils/torch_utils.py
+index 5945c2d..e288451 100644
+--- a/utils/torch_utils.py
++++ b/utils/torch_utils.py
+@@ -32,6 +32,14 @@ from ultralytics.utils.torch_utils import (  # noqa: F401
+ 
+ from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
+ 
++def _ao_on(name, default="1"):
++    """True unless the env var is explicitly turned off."""
++    return str(os.getenv(name, default)).lower() not in ("0", "false", "no")
++
++
++AO_OPT_22 = _ao_on("YOLOV5_AO_OPT_10")
++AO_OPT_23 = _ao_on("YOLOV5_AO_OPT_11")
++
+ LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1"))  # https://pytorch.org/docs/stable/elastic/run.html
+ RANK = int(os.getenv("RANK", "-1"))
+ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
+@@ -45,6 +53,49 @@ except ImportError:
+ warnings.filterwarnings("ignore", category=UserWarning)
+ 
+ 
++
++class Opt21:
++
++    def __init__(self, model, warmup=3, opt_24=32):
++        self.model = model
++        self.warmup = warmup
++        self.opt_24 = opt_24
++        self.graphs = {}
++
++    def __call__(self, im, augment=False, visualize=False):
++        if augment or visualize or not im.is_cuda:
++            return self.model(im, augment=augment, visualize=visualize)
++        key = tuple(im.shape)
++        entry = self.graphs.get(key)
++        if entry is None:
++            if len(self.graphs) >= self.opt_24:
++                return self.model(im)
++            entry = self._opt_25(im)
++            self.graphs[key] = entry
++        graph, opt_26, opt_27 = entry
++        opt_26.copy_(im)
++        graph.replay()
++        return opt_27.clone()
++
++    def _opt_25(self, im):
++        opt_26 = im.clone()
++        side = torch.cuda.Stream()
++        side.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(side):
++            for _ in range(self.warmup):
++                self._forward(opt_26)
++        torch.cuda.current_stream().wait_stream(side)
++        torch.cuda.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            opt_27 = self._forward(opt_26)
++        return graph, opt_26, opt_27
++
++    def _forward(self, x):
++        y = self.model(x)
++        return y[0] if isinstance(y, (list, tuple)) else y
++
++
+ def smart_inference_mode(torch_1_9=check_version(torch.__version__, "1.9.0")):  # noqa: B008
+     """Applies torch.inference_mode() if torch>=1.9.0, else torch.no_grad() as a decorator for functions."""
+ 
+@@ -248,9 +299,9 @@ def fuse_conv_and_bn(conv, bn):
+     )
+ 
+     # Prepare filters
+-    w_conv = conv.weight.clone().view(conv.out_channels, -1)
++    w_conv = conv.weight.clone().reshape(conv.out_channels, -1)
+     w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+-    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
++    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).reshape(fusedconv.weight.shape))
+ 
+     # Prepare spatial bias
+     b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
+@@ -283,7 +334,9 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
+     elif name == "RMSProp":
+         optimizer = torch.optim.RMSprop(g[2], lr=lr, momentum=momentum)
+     elif name == "SGD":
+-        optimizer = torch.optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
++        optimizer = torch.optim.SGD(
++            g[2], lr=lr, momentum=momentum, nesterov=True, fused=AO_OPT_23
++        )
+     else:
+         raise NotImplementedError(f"Optimizer {name} not implemented.")
+ 
+@@ -368,6 +421,19 @@ class ModelEMA:
+         d = self.decay(self.updates)
+ 
+         msd = de_parallel(model).state_dict()  # model state_dict
++        if AO_OPT_22:
++            pairs = getattr(self, "_ao_pairs", None)
++            if pairs is None:
++                ev, mv = [], []
++                for k, v in self.ema.state_dict().items():
++                    if v.dtype.is_floating_point:
++                        ev.append(v)
++                        mv.append(msd[k].detach())
++                pairs = self._ao_pairs = (ev, mv)
++            with torch.no_grad():
++                torch._foreach_mul_(pairs[0], d)
++                torch._foreach_add_(pairs[0], pairs[1], alpha=1 - d)
++            return
+         for k, v in self.ema.state_dict().items():
+             if v.dtype.is_floating_point:  # true for FP16 and FP32
+                 v *= d
+diff --git a/val.py b/val.py
+index 08c05d4..fe06445 100644
+--- a/val.py
++++ b/val.py
+@@ -108,6 +108,21 @@ def save_one_json(predn, jdict, path, class_map):
+         )
+ 
+ 
++def _ao_opt_28(model):
++    flag = getattr(model, "_ao_opt_29", None)
++    if flag is None:
++        flag = False
++        for p in model.parameters():
++            if p.dim() == 4:
++                flag = p.is_contiguous(memory_format=torch.channels_last) and not p.is_contiguous()
++                break
++        try:
++            model._ao_opt_29 = flag
++        except (AttributeError, RuntimeError):
++            pass
++    return flag
++
++
+ @smart_inference_mode()
+ def run(
+     data,
+@@ -260,6 +275,8 @@ def run(
+                 targets = targets.to(device)
+             im = im.half() if half else im.float()  # uint8 to fp16/32
+             im /= 255  # 0 - 255 to 0.0 - 1.0
++            if _ao_opt_28(model):
++                im = im.contiguous(memory_format=torch.channels_last)
+             nb, _, height, width = im.shape  # batch size, channels, height, width
+ 
+         # Inference

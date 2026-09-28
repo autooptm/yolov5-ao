@@ -262,6 +262,29 @@ class LoadScreenshots:
         return str(self.screen), im, im0, None, s  # screen, img, original img, im0s, s
 
 
+_OPT_19 = {}
+
+
+def _opt_30(im0, img_size, stride):
+    new_shape = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
+    h, w = im0.shape[:2]
+    r = min(new_shape[0] / h, new_shape[1] / w)
+    nw, nh = round(w * r), round(h * r)
+    dw, dh = ((new_shape[1] - nw) % stride) / 2, ((new_shape[0] - nh) % stride) / 2
+    top, bottom = round(dh - 0.1), round(dh + 0.1)
+    left, right = round(dw - 0.1), round(dw + 0.1)
+    im = cv2.resize(im0, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nh, nw) != (h, w) else im0
+    if not (top or bottom or left or right):
+        return im
+    key = (nh + top + bottom, nw + left + right, top, left)
+    buf = _OPT_19.get(key)
+    if buf is None:
+        buf = np.full((key[0], key[1], 3), 114, dtype=np.uint8)
+        _OPT_19[key] = buf
+    buf[top : top + nh, left : left + nw] = im
+    return buf
+
+
 class LoadImages:
     """YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`."""
 
@@ -294,6 +317,7 @@ class LoadImages:
         self.auto = auto
         self.transforms = transforms  # optional
         self.vid_stride = vid_stride  # video frame-rate stride
+        self._queue = None
         if any(videos):
             self._new_video(videos[0])  # new video
         else:
@@ -305,10 +329,42 @@ class LoadImages:
     def __iter__(self):
         """Initializes iterator by resetting count and returns the iterator object itself."""
         self.count = 0
+        self._queue = None
+        if os.environ.get("YOLOV5_OPT_9", "1") != "0" and not any(self.video_flag):
+            import queue
+            import threading
+
+            self._queue = queue.Queue(maxsize=2)
+            threading.Thread(target=self._opt_20, daemon=True).start()
         return self
+
+    def _opt_20(self):
+        for i, path in enumerate(self.files):
+            try:
+                im0 = cv2.imread(path)  # BGR
+                assert im0 is not None, f"Image Not Found {path}"
+                if self.transforms:
+                    im = self.transforms(im0)
+                else:
+                    im = _opt_30(im0, self.img_size, self.stride)
+                    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                    im = np.ascontiguousarray(im)  # contiguous — releases the shared buffer
+                item = (path, im, im0, None, f"image {i + 1}/{self.nf} {path}: ")
+            except Exception as exc:  # raised in the consumer, where the stock code raises
+                item = exc
+            self._queue.put(item)
+        self._queue.put(None)
 
     def __next__(self):
         """Advances to the next file in the dataset, raising StopIteration if at the end."""
+        if self._queue is not None:
+            item = self._queue.get()
+            if item is None:
+                raise StopIteration
+            if isinstance(item, Exception):
+                raise item
+            self.count += 1
+            return item
         if self.count == self.nf:
             raise StopIteration
         path = self.files[self.count]

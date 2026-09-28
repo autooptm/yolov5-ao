@@ -18,6 +18,7 @@ import argparse
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -96,6 +97,18 @@ from utils.torch_utils import (
     smart_resume,
     torch_distributed_zero_first,
 )
+
+def _ao_on(name, default="1"):
+    """True unless the env var is explicitly turned off."""
+    return str(os.getenv(name, default)).lower() not in ("0", "false", "no")
+
+
+AO_OPT_13 = _ao_on("YOLOV5_AO_OPT_3")
+AO_OPT_14 = _ao_on("YOLOV5_AO_OPT_4")
+AO_OPT_15 = _ao_on("YOLOV5_AO_OPT_5")
+AO_OPT_16 = _ao_on("YOLOV5_AO_OPT_6")
+AO_OPT_17 = _ao_on("YOLOV5_AO_OPT_7")
+AO_OPT_18 = _ao_on("YOLOV5_AO_OPT_8")
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1"))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv("RANK", "-1"))
@@ -188,7 +201,7 @@ def train(hyp, opt, device, callbacks):
     # Config
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != "cpu"
-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
+    init_seeds(opt.seed + 1 + RANK, deterministic=not AO_OPT_13)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict["train"], data_dict["val"]
@@ -211,6 +224,11 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+    if AO_OPT_17:
+        for _m in model.modules():
+            if isinstance(_m, nn.Conv2d) and _m.weight.dim() == 4:
+                _m.weight.data = _m.weight.data.contiguous(memory_format=torch.channels_last)
+
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -280,7 +298,7 @@ def train(hyp, opt, device, callbacks):
         single_cls,
         hyp=hyp,
         augment=True,
-        cache=None if opt.cache == "val" else opt.cache,
+        cache=None if opt.cache == "val" else (opt.cache or ("ram" if AO_OPT_18 else None)),
         rect=opt.rect,
         rank=LOCAL_RANK,
         workers=workers,
@@ -303,7 +321,7 @@ def train(hyp, opt, device, callbacks):
             gs,
             single_cls,
             hyp=hyp,
-            cache=None if noval else opt.cache,
+            cache=None if noval else (opt.cache or ("ram" if AO_OPT_16 else None)),
             rect=True,
             rank=-1,
             workers=workers * 2,
@@ -378,6 +396,8 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            if AO_OPT_17:
+                imgs = imgs.contiguous(memory_format=torch.channels_last)
 
             # Warmup
             if ni <= nw:
@@ -425,9 +445,10 @@ def train(hyp, opt, device, callbacks):
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+                _ml = mloss.tolist() if AO_OPT_15 else mloss
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    % (f"{epoch}/{epochs - 1}", mem, *_ml, targets.shape[0], imgs.shape[-1])
                 )
                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
@@ -482,7 +503,10 @@ def train(hyp, opt, device, callbacks):
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
-                    torch.save(ckpt, best)
+                    if AO_OPT_14:
+                        shutil.copyfile(last, best)
+                    else:
+                        torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f"epoch{epoch}.pt")
                 del ckpt

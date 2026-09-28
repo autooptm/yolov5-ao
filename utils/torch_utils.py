@@ -32,6 +32,14 @@ from ultralytics.utils.torch_utils import (  # noqa: F401
 
 from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
 
+def _ao_on(name, default="1"):
+    """True unless the env var is explicitly turned off."""
+    return str(os.getenv(name, default)).lower() not in ("0", "false", "no")
+
+
+AO_OPT_22 = _ao_on("YOLOV5_AO_OPT_10")
+AO_OPT_23 = _ao_on("YOLOV5_AO_OPT_11")
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1"))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv("RANK", "-1"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
@@ -43,6 +51,49 @@ except ImportError:
 
 # Suppress PyTorch warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+
+class Opt21:
+
+    def __init__(self, model, warmup=3, opt_24=32):
+        self.model = model
+        self.warmup = warmup
+        self.opt_24 = opt_24
+        self.graphs = {}
+
+    def __call__(self, im, augment=False, visualize=False):
+        if augment or visualize or not im.is_cuda:
+            return self.model(im, augment=augment, visualize=visualize)
+        key = tuple(im.shape)
+        entry = self.graphs.get(key)
+        if entry is None:
+            if len(self.graphs) >= self.opt_24:
+                return self.model(im)
+            entry = self._opt_25(im)
+            self.graphs[key] = entry
+        graph, opt_26, opt_27 = entry
+        opt_26.copy_(im)
+        graph.replay()
+        return opt_27.clone()
+
+    def _opt_25(self, im):
+        opt_26 = im.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(self.warmup):
+                self._forward(opt_26)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            opt_27 = self._forward(opt_26)
+        return graph, opt_26, opt_27
+
+    def _forward(self, x):
+        y = self.model(x)
+        return y[0] if isinstance(y, (list, tuple)) else y
 
 
 def smart_inference_mode(torch_1_9=check_version(torch.__version__, "1.9.0")):  # noqa: B008
@@ -248,9 +299,9 @@ def fuse_conv_and_bn(conv, bn):
     )
 
     # Prepare filters
-    w_conv = conv.weight.clone().view(conv.out_channels, -1)
+    w_conv = conv.weight.clone().reshape(conv.out_channels, -1)
     w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
+    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).reshape(fusedconv.weight.shape))
 
     # Prepare spatial bias
     b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
@@ -283,7 +334,9 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
     elif name == "RMSProp":
         optimizer = torch.optim.RMSprop(g[2], lr=lr, momentum=momentum)
     elif name == "SGD":
-        optimizer = torch.optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
+        optimizer = torch.optim.SGD(
+            g[2], lr=lr, momentum=momentum, nesterov=True, fused=AO_OPT_23
+        )
     else:
         raise NotImplementedError(f"Optimizer {name} not implemented.")
 
@@ -368,6 +421,19 @@ class ModelEMA:
         d = self.decay(self.updates)
 
         msd = de_parallel(model).state_dict()  # model state_dict
+        if AO_OPT_22:
+            pairs = getattr(self, "_ao_pairs", None)
+            if pairs is None:
+                ev, mv = [], []
+                for k, v in self.ema.state_dict().items():
+                    if v.dtype.is_floating_point:
+                        ev.append(v)
+                        mv.append(msd[k].detach())
+                pairs = self._ao_pairs = (ev, mv)
+            with torch.no_grad():
+                torch._foreach_mul_(pairs[0], d)
+                torch._foreach_add_(pairs[0], pairs[1], alpha=1 - d)
+            return
         for k, v in self.ema.state_dict().items():
             if v.dtype.is_floating_point:  # true for FP16 and FP32
                 v *= d

@@ -116,6 +116,10 @@ class Detect(nn.Module):
 
     def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, "1.10.0")):  # noqa: B008
         """Generates a mesh grid for anchor boxes with optional compatibility for torch versions < 1.10."""
+        key = (nx, ny, i)
+        cache = self.__dict__.setdefault("_grid_cache", {})
+        if key in cache:
+            return cache[key]
         d = self.anchors[i].device
         t = self.anchors[i].dtype
         shape = 1, self.na, ny, nx, 2  # grid shape
@@ -125,6 +129,7 @@ class Detect(nn.Module):
         )  # torch>=1.10 compatibility
         grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
         anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        cache[key] = (grid, anchor_grid)
         return grid, anchor_grid
 
 
@@ -206,6 +211,7 @@ class BaseModel(nn.Module):
         m = self.model[-1]  # Detect()
         if isinstance(m, (Detect, Segment)):
             m.stride = fn(m.stride)
+            m.__dict__.pop("_grid_cache", None)
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
                 m.anchor_grid = list(map(fn, m.anchor_grid))

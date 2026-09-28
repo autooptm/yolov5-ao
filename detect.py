@@ -64,7 +64,32 @@ from utils.general import (
     strip_optimizer,
     xyxy2xywh,
 )
-from utils.torch_utils import select_device, smart_inference_mode
+from utils.torch_utils import Opt21, select_device, smart_inference_mode
+
+
+class _Opt12:
+
+    def __init__(self, depth=2):
+        import queue
+        import threading
+
+        self.q = queue.Queue(maxsize=depth)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            cv2.imwrite(item[0], item[1])
+
+    def write(self, path, im):
+        self.q.put((path, im))
+
+    def close(self):
+        self.q.put(None)
+        self.thread.join()
 
 
 @smart_inference_mode()
@@ -200,6 +225,13 @@ def run(
 
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
+    if pt and device.type != "cpu" and os.environ.get("YOLOV5_OPT_1", "1") != "0":
+        model.forward = Opt21(model.model)
+    writer = (
+        _Opt12()
+        if save_img and not webcam and os.environ.get("YOLOV5_OPT_2", "1") != "0"
+        else None
+    )
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
@@ -246,6 +278,7 @@ def run(
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                det = det.cpu()
 
                 # Print results
                 for c in det[:, 5].unique():
@@ -293,7 +326,10 @@ def run(
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == "image":
-                    cv2.imwrite(save_path, im0)
+                    if writer is not None:
+                        writer.write(save_path, im0)
+                    else:
+                        cv2.imwrite(save_path, im0)
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
@@ -311,6 +347,9 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
+
+    if writer is not None:
+        writer.close()
 
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
